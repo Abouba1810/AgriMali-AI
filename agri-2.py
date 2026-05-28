@@ -218,7 +218,30 @@ if active_file is not None:
         top = results[0]
         st.write("### Résultat")
 
-        if top["is_healthy"]:
+        if top["confidence"] < 55.0:
+            st.markdown(f"""
+                <div style="background-color:#ff9800; color:white; padding:25px;
+                            border-radius:16px; text-align:center;
+                            box-shadow:0px 4px 12px rgba(255,152,0,0.35);">
+                    <div style='font-size:50px;'>🤔</div>
+                    <h2 style='margin:5px 0 0 0;'>ANALYSE INCERTAINE</h2>
+                    <h3 style='margin:8px 0 0 0;'>Confiance : {top['confidence']:.1f}%</h3>
+                    <p style='margin:10px 0 0 0; opacity:0.95;'>
+                        L'IA n'arrive pas à identifier clairement l'état de cette feuille.<br>
+                        S'agit-il bien d'une feuille de plante connue ?
+                    </p>
+                    <hr style='border:1px solid rgba(255,255,255,0.4); margin:15px 0;'>
+                    <p style='font-style:italic; margin:0; font-size:14px;'>
+                        💡 Conseils pour une meilleure photo :<br>
+                        • Rapproche l'appareil de la zone touchée<br>
+                        • Utilise une lumière naturelle claire<br>
+                        • Évite les ombres et les reflets<br>
+                        • Cadre une seule feuille à la fois
+                    </p>
+                </div>
+            """, unsafe_allow_html=True)
+
+        elif top["is_healthy"]:
             st.markdown(f"""
                 <div class="status-card-healthy">
                     <div style='font-size:50px;'>😊</div>

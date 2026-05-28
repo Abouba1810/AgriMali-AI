@@ -751,8 +751,43 @@ def load_model():
     return model, classes
 
 
+# ─── SUPPRESSION DE FOND (rembg) ─────────────────────────────────────
+@st.cache_resource
+def load_rembg():
+    """
+    Charge le modèle rembg une seule fois.
+    - isnet-general-use : meilleur détourage sur objets organiques (feuilles)
+    - fallback sur u2net si isnet indisponible
+    """
+    try:
+        from rembg import new_session
+        try:
+            session = new_session("isnet-general-use")
+        except Exception:
+            session = new_session("u2net")  # fallback
+        return session
+    except Exception:
+        return None
+
+
+def remove_background(image: Image.Image, session) -> Image.Image:
+    """
+    Supprime le fond et remplace par blanc (neutre pour le modèle).
+    Retourne l'image originale en cas d'échec.
+    """
+    try:
+        from rembg import remove
+        img_no_bg = remove(image, session=session)          # RGBA
+        background = Image.new("RGBA", img_no_bg.size, (255, 255, 255, 255))
+        background.paste(img_no_bg, mask=img_no_bg.split()[3])
+        return background.convert("RGB")
+    except Exception:
+        return image  # fallback silencieux
+
+
 # ─── INFÉRENCE ────────────────────────────────────────────────────────
-def predict(image: Image.Image, model, classes):
+def _run_inference(image: Image.Image, model, classes) -> list:
+    """Inférence brute sur une image PIL."""
     transform = transforms.Compose([
         transforms.Resize((int(384 * 1.14), int(384 * 1.14))),
         transforms.CenterCrop(384),
@@ -769,19 +804,47 @@ def predict(image: Image.Image, model, classes):
     top3_probs, top3_idx = torch.topk(probabilities, min(3, len(classes)))
     results = []
     for prob, idx in zip(top3_probs.tolist(), top3_idx.tolist()):
-        raw = classes[idx]
-        # Nom affiché propre
-        clean = raw.split("___")[-1].replace("_", " ").title() if "___" in raw else raw.replace("_", " ").title()
-        is_healthy = "healthy" in raw.lower()
-        info = get_disease_info(raw)
+        raw   = classes[idx]
+        clean = (raw.split("___")[-1].replace("_", " ").title()
+                 if "___" in raw else raw.replace("_", " ").title())
         results.append({
             "label":      clean,
             "raw":        raw,
             "confidence": prob * 100,
-            "is_healthy": is_healthy,
-            "info":       info,
+            "is_healthy": "healthy" in raw.lower(),
+            "info":       get_disease_info(raw),
         })
     return results
+
+
+CONFIDENCE_THRESHOLD   = 55.0   # en dessous : analyse incertaine
+REMBG_TRIGGER          = 70.0   # en dessous : on tente la suppression de fond
+
+
+def predict(image: Image.Image, model, classes, rembg_session=None):
+    """
+    Stratégie en 2 passes :
+      1. Inférence sur l'image originale.
+      2. Si confiance < REMBG_TRIGGER et rembg disponible,
+         on retente sur l'image sans fond et on garde le meilleur résultat.
+    Retourne (results, bg_removed: bool, image_used: PIL.Image).
+    """
+    results_orig = _run_inference(image, model, classes)
+    top_conf     = results_orig[0]["confidence"]
+
+    # Pas besoin de rembg si confiance déjà bonne ou session indisponible
+    if top_conf >= REMBG_TRIGGER or rembg_session is None:
+        return results_orig, False, image
+
+    # 2ème passe sans fond
+    image_clean    = remove_background(image, rembg_session)
+    results_clean  = _run_inference(image_clean, model, classes)
+    top_conf_clean = results_clean[0]["confidence"]
+
+    if top_conf_clean > top_conf:
+        return results_clean, True, image_clean
+    else:
+        return results_orig, False, image
 
 
 # ─── INTERFACE ────────────────────────────────────────────────────────
@@ -798,6 +861,10 @@ st.markdown("---")
 model, classes = load_model()
 if model is None:
     st.stop()
+
+rembg_session = load_rembg()
+if rembg_session is None:
+    st.caption("ℹ️ rembg non disponible — suppression de fond désactivée. (`pip install rembg`)")
 
 st.markdown(
     '<div class="hint-text">📸 Prenez une photo claire de la feuille de votre plante, '
@@ -836,8 +903,23 @@ if active_file is not None:
 
     st.write("")
     if st.button("🔍 ANALYSER LA FEUILLE"):
-        with st.spinner("🔬 Analyse en cours..."):
-            results = predict(image, model, classes)
+        with st.spinner("🔬 Analyse en cours…"):
+            results, bg_was_removed, image_used = predict(
+                image, model, classes, rembg_session
+            )
+
+        # ── Affichage de l'image traitée si rembg a été utilisé ──────
+        if bg_was_removed:
+            st.markdown(
+                "<p style='font-size:13px; color:#2e7d32; margin-bottom:4px;'>"
+                "✂️ <b>Fond supprimé automatiquement</b> — la confiance a augmenté.</p>",
+                unsafe_allow_html=True,
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(image,      caption="Image originale",    use_container_width=True)
+            with col2:
+                st.image(image_used, caption="Sans fond (analysée)", use_container_width=True)
 
         top  = results[0]
         info = top["info"]

@@ -751,38 +751,96 @@ def load_model():
     return model, classes
 
 
-# ─── SUPPRESSION DE FOND (rembg) ─────────────────────────────────────
-@st.cache_resource
-def load_rembg():
+# ─── RECADRAGE INTELLIGENT (OpenCV) ──────────────────────────────────
+import cv2
+import numpy as np
+
+def smart_crop(image: Image.Image) -> tuple[Image.Image, bool]:
     """
-    Charge le modèle rembg une seule fois.
-    - isnet-general-use : meilleur détourage sur objets organiques (feuilles)
-    - fallback sur u2net si isnet indisponible
+    Détecte le plus grand contour vert/végétal (feuille) dans l'image
+    et recadre autour de son bounding box avec une marge de 10%.
+
+    Stratégie :
+      1. Conversion en HSV → masque de la plage verte/végétale
+      2. Morphologie pour nettoyer le masque
+      3. Plus grand contour → bounding box
+      4. Si la bbox couvre > 10% de l'image → recadrage
+      5. Sinon fallback : crop carré centré (meilleur que rien)
+
+    Retourne (image_croppée, crop_intelligent_réussi).
     """
-    try:
-        from rembg import new_session
-        try:
-            session = new_session("isnet-general-use")
-        except Exception:
-            session = new_session("u2net")  # fallback
-        return session
-    except Exception:
-        return None
+    img_rgb = np.array(image.convert("RGB"))
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    h, w    = img_bgr.shape[:2]
+
+    # ── 1. Masque HSV pour détecter les tons végétaux ─────────────────
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # Plage verte (feuilles saines + malades jaunies/brûlées incluses)
+    lower_green  = np.array([25,  30,  30])   # jaune-vert jusqu'à vert foncé
+    upper_green  = np.array([95, 255, 255])
+    mask_green   = cv2.inRange(hsv, lower_green, upper_green)
+
+    # Plage brune/orange (taches de maladies fréquentes)
+    lower_brown  = np.array([5,  40,  40])
+    upper_brown  = np.array([25, 255, 220])
+    mask_brown   = cv2.inRange(hsv, lower_brown, upper_brown)
+
+    mask = cv2.bitwise_or(mask_green, mask_brown)
+
+    # ── 2. Morphologie : fermeture pour boucher les trous ─────────────
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=1)
+
+    # ── 3. Trouver le plus grand contour ──────────────────────────────
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return _center_square_crop(image), False
+
+    largest = max(contours, key=cv2.contourArea)
+    area    = cv2.contourArea(largest)
+
+    # Si le contour est trop petit (< 10% de l'image) → pas de feuille détectée
+    if area < 0.10 * h * w:
+        return _center_square_crop(image), False
+
+    # ── 4. Bounding box + marge 10% ───────────────────────────────────
+    x, y, bw, bh = cv2.boundingRect(largest)
+    margin_x = int(bw * 0.10)
+    margin_y = int(bh * 0.10)
+
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(w, x + bw + margin_x)
+    y2 = min(h, y + bh + margin_y)
+
+    # ── 5. Recadrage carré centré sur la bbox (évite déformation) ─────
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    side   = max(crop_w, crop_h)
+
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+
+    sx = max(0, cx - side // 2)
+    sy = max(0, cy - side // 2)
+    ex = min(w, sx + side)
+    ey = min(h, sy + side)
+
+    cropped_bgr = img_bgr[sy:ey, sx:ex]
+    cropped_pil = Image.fromarray(cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB))
+    return cropped_pil, True
 
 
-def remove_background(image: Image.Image, session) -> Image.Image:
-    """
-    Supprime le fond et remplace par blanc (neutre pour le modèle).
-    Retourne l'image originale en cas d'échec.
-    """
-    try:
-        from rembg import remove
-        img_no_bg = remove(image, session=session)          # RGBA
-        background = Image.new("RGBA", img_no_bg.size, (255, 255, 255, 255))
-        background.paste(img_no_bg, mask=img_no_bg.split()[3])
-        return background.convert("RGB")
-    except Exception:
-        return image  # fallback silencieux
+def _center_square_crop(image: Image.Image) -> Image.Image:
+    """Crop carré centré — fallback simple."""
+    w, h      = image.size
+    side      = min(w, h)
+    left      = (w - side) // 2
+    top       = (h - side) // 2
+    return image.crop((left, top, left + side, top + side))
 
 
 # ─── INFÉRENCE ────────────────────────────────────────────────────────
@@ -798,7 +856,7 @@ def _run_inference(image: Image.Image, model, classes) -> list:
     img_tensor = transform(image).unsqueeze(0)
 
     with torch.no_grad():
-        outputs = model(img_tensor)
+        outputs       = model(img_tensor)
         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
 
     top3_probs, top3_idx = torch.topk(probabilities, min(3, len(classes)))
@@ -817,32 +875,37 @@ def _run_inference(image: Image.Image, model, classes) -> list:
     return results
 
 
-CONFIDENCE_THRESHOLD   = 55.0   # en dessous : analyse incertaine
-REMBG_TRIGGER          = 70.0   # en dessous : on tente la suppression de fond
+CONFIDENCE_THRESHOLD = 55.0   # en dessous : analyse incertaine
+SMART_CROP_TRIGGER   = 70.0   # en dessous : on tente le recadrage intelligent
 
 
-def predict(image: Image.Image, model, classes, rembg_session=None):
+def predict(image: Image.Image, model, classes):
     """
     Stratégie en 2 passes :
       1. Inférence sur l'image originale.
-      2. Si confiance < REMBG_TRIGGER et rembg disponible,
-         on retente sur l'image sans fond et on garde le meilleur résultat.
-    Retourne (results, bg_removed: bool, image_used: PIL.Image).
+      2. Si confiance < SMART_CROP_TRIGGER, on détecte et recadre
+         la feuille avec OpenCV, on retente et on garde le meilleur.
+
+    Retourne (results, crop_used: bool, image_used: PIL.Image).
     """
     results_orig = _run_inference(image, model, classes)
     top_conf     = results_orig[0]["confidence"]
 
-    # Pas besoin de rembg si confiance déjà bonne ou session indisponible
-    if top_conf >= REMBG_TRIGGER or rembg_session is None:
+    if top_conf >= SMART_CROP_TRIGGER:
         return results_orig, False, image
 
-    # 2ème passe sans fond
-    image_clean    = remove_background(image, rembg_session)
-    results_clean  = _run_inference(image_clean, model, classes)
-    top_conf_clean = results_clean[0]["confidence"]
+    # 2ème passe avec recadrage intelligent
+    image_cropped, crop_succeeded = smart_crop(image)
 
-    if top_conf_clean > top_conf:
-        return results_clean, True, image_clean
+    if not crop_succeeded:
+        # Pas de feuille détectée → inutile de re-inférer
+        return results_orig, False, image
+
+    results_crop  = _run_inference(image_cropped, model, classes)
+    top_conf_crop = results_crop[0]["confidence"]
+
+    if top_conf_crop > top_conf:
+        return results_crop, True, image_cropped
     else:
         return results_orig, False, image
 
@@ -861,10 +924,6 @@ st.markdown("---")
 model, classes = load_model()
 if model is None:
     st.stop()
-
-rembg_session = load_rembg()
-if rembg_session is None:
-    st.caption("ℹ️ rembg non disponible — suppression de fond désactivée. (`pip install rembg`)")
 
 st.markdown(
     '<div class="hint-text">📸 Prenez une photo claire de la feuille de votre plante, '
@@ -904,22 +963,21 @@ if active_file is not None:
     st.write("")
     if st.button("🔍 ANALYSER LA FEUILLE"):
         with st.spinner("🔬 Analyse en cours…"):
-            results, bg_was_removed, image_used = predict(
-                image, model, classes, rembg_session
-            )
+            results, crop_was_used, image_used = predict(image, model, classes)
 
-        # ── Affichage de l'image traitée si rembg a été utilisé ──────
-        if bg_was_removed:
+        # ── Affichage comparatif si le recadrage a amélioré ──────────
+        if crop_was_used:
             st.markdown(
                 "<p style='font-size:13px; color:#2e7d32; margin-bottom:4px;'>"
-                "✂️ <b>Fond supprimé automatiquement</b> — la confiance a augmenté.</p>",
+                "✂️ <b>Recadrage automatique</b> — feuille détectée et centrée "
+                "pour une meilleure analyse.</p>",
                 unsafe_allow_html=True,
             )
             col1, col2 = st.columns(2)
             with col1:
-                st.image(image,      caption="Image originale",    use_container_width=True)
+                st.image(image,      caption="Photo originale",      use_container_width=True)
             with col2:
-                st.image(image_used, caption="Sans fond (analysée)", use_container_width=True)
+                st.image(image_used, caption="Feuille recadrée (analysée)", use_container_width=True)
 
         top  = results[0]
         info = top["info"]

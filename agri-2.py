@@ -596,7 +596,7 @@ def get_disease_info(raw_label: str) -> dict:
     return DISEASE_DB["default"]
 
 
-# ─── AUDIO : gTTS (français) + MALIBA-AI (bambara) ───────────────────
+# ─── AUDIO : gTTS (français) + MALIBA-AI (traduction + TTS bambara) ──
 
 def text_to_audio_b64_fr(text: str) -> str | None:
     """gTTS en français → base64 MP3."""
@@ -611,38 +611,93 @@ def text_to_audio_b64_fr(text: str) -> str | None:
         return None
 
 
-def text_to_audio_b64_bambara(text: str) -> str | None:
+@st.cache_resource
+def load_bambara_translator():
     """
-    Appelle Abouba1810/agrimali-bambaraTTS via l'API Gradio.
+    Charge sudoping01/nllb-200-600M-bambara-nko directement (une seule fois).
+    Basé sur NLLB-200 fine-tuné sur le bambara malien.
+    ~2.4GB — mis en cache par Streamlit après le premier téléchargement.
+    """
+    try:
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        model_id = "sudoping01/nllb-200-600M-bambara-nko"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model     = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+        model.eval()
+        return tokenizer, model
+    except Exception as e:
+        st.warning(f"Traducteur bambara indisponible : {e}")
+        return None, None
 
-    D'après le code source du Space (app.py) :
-      - modèle   : sudoping01/bambara-tts (VitsModel / Meta MMS)
+
+def translate_fr_to_bambara(text_fr: str) -> str | None:
+    """
+    Traduit du français vers le bambara via nllb-200-600M-bambara-nko.
+
+    Codes de langue NLLB :
+      - Français  : fra_Latn
+      - Bambara   : bam_Latn  (latin — orthographe standard malienne)
+    """
+    tokenizer, model = load_bambara_translator()
+    if tokenizer is None or model is None:
+        return None
+    try:
+        from transformers import AutoTokenizer
+        import torch
+
+        # Forcer la langue source
+        tokenizer.src_lang = "fra_Latn"
+
+        inputs = tokenizer(
+            text_fr,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+
+        # Token cible bambara
+        forced_bos = tokenizer.convert_tokens_to_ids("bam_Latn")
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos,
+                max_new_tokens=256,
+                num_beams=4,
+                early_stopping=True,
+            )
+
+        translated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return translated.strip() if translated.strip() else None
+    except Exception:
+        return None
+
+
+def text_to_audio_b64_bambara(text_bam: str) -> str | None:
+    """
+    Génère l'audio bambara via Abouba1810/agrimali-bambaraTTS.
+    text_bam doit déjà être en bambara (traduit ou extrait du DISEASE_DB).
+
+    D'après le code source du Space :
       - endpoint : /generate_audio
       - input    : text (str) — UN SEUL argument
-      - output   : tuple (sample_rate: int, waveform: np.ndarray)
-                   → gradio_client retourne un fichier WAV temporaire local
-
-    Retourne le base64 WAV, ou None si le Space est indisponible.
+      - output   : (sample_rate, waveform_numpy) → fichier WAV temporaire local
     """
     try:
         from gradio_client import Client
         client = Client("Abouba1810/agrimali-bambaraTTS", verbose=False)
         result = client.predict(
-            text,
+            text_bam,
             api_name="/generate_audio",
         )
-        # Le Space retourne (sample_rate, waveform_numpy).
-        # gradio_client sérialise le numpy audio en un fichier WAV local.
-        # result[0] = chemin WAV temporaire, result[1] = message d'erreur éventuel
+        # Cas 1 : tuple/liste → result[0] est le chemin WAV ou (sr, array)
         if isinstance(result, (tuple, list)):
             audio_part = result[0]
-            # audio_part peut être un chemin fichier (str) ou un tuple (sr, array)
             if isinstance(audio_part, str) and os.path.exists(audio_part):
                 with open(audio_part, "rb") as f:
                     return base64.b64encode(f.read()).decode("utf-8")
-            # Fallback : encoder le numpy directement en WAV en mémoire
             if isinstance(audio_part, (tuple, list)) and len(audio_part) == 2:
-                import numpy as np
                 import scipy.io.wavfile as wav_io
                 sr, waveform = audio_part
                 waveform = np.array(waveform)
@@ -652,7 +707,7 @@ def text_to_audio_b64_bambara(text: str) -> str | None:
                 wav_io.write(buf, sr, waveform)
                 buf.seek(0)
                 return base64.b64encode(buf.read()).decode("utf-8")
-        # result est directement un chemin fichier
+        # Cas 2 : chemin fichier direct
         if isinstance(result, str) and os.path.exists(result):
             with open(result, "rb") as f:
                 return base64.b64encode(f.read()).decode("utf-8")
@@ -677,25 +732,46 @@ def play_audio_fr(text: str, label: str = "Écouter en français 🇫🇷"):
         st.markdown(_audio_player_html(b64, "audio/mp3"), unsafe_allow_html=True)
 
 
-def play_audio_bambara(text: str, label: str = "Kelima bambara kan 🇲🇱"):
+def play_audio_bambara(text_fr: str, text_bam_fallback: str = "",
+                       label: str = "Kelima bambara kan 🇲🇱"):
     """
-    Lecture audio en bambara via MALIBA-AI/BambaraText2Speech.
-    Affiche un spinner pendant la génération (le Space peut mettre 3-8s).
-    Si le Space est indisponible, affiche un message discret sans planter.
+    Pipeline complète :
+      1. Traduit le texte français → bambara via MALIBA-AI/BambaraTranslator
+      2. Si traduction ok → génère l'audio avec agrimali-bambaraTTS
+      3. Si traduction échoue → tente le texte bambara du DISEASE_DB (fallback)
+      4. Affiche le statut de chaque étape proprement
+
+    text_fr            : texte source en français (pour la traduction)
+    text_bam_fallback  : texte bambara du DISEASE_DB (fallback si traduction échoue)
     """
+    with st.spinner("🌍 Traduction français → bambara…"):
+        text_bam_traduit = translate_fr_to_bambara(text_fr)
+
+    if text_bam_traduit:
+        # Affiche la traduction obtenue
+        st.markdown(
+            f'<div style="background:#e8f5e9; color:#1b5e20; padding:8px 12px; '
+            f'border-radius:8px; font-size:13px; margin-bottom:6px;">'
+            f'📝 <b>Traduction :</b> {text_bam_traduit}</div>',
+            unsafe_allow_html=True,
+        )
+        text_for_tts = text_bam_traduit
+    elif text_bam_fallback:
+        # Fallback sur le texte bambara du dictionnaire
+        st.caption("ℹ️ Traduction indisponible — utilisation du texte bambara prédéfini.")
+        text_for_tts = text_bam_fallback
+    else:
+        st.caption("🔇 Bambara indisponible pour l'instant.")
+        return
+
     with st.spinner("🔊 Génération audio bambara…"):
-        b64 = text_to_audio_b64_bambara(text)
+        b64 = text_to_audio_b64_bambara(text_for_tts)
 
     if b64:
         st.markdown(f'<div class="audio-label">🔊 {label}</div>', unsafe_allow_html=True)
-        # Le Space retourne du WAV
         st.markdown(_audio_player_html(b64, "audio/wav"), unsafe_allow_html=True)
     else:
-        st.caption(
-            "🔇 Audio bambara indisponible pour l'instant "
-            "(Space en veille — réessayez dans 30 secondes)."
-        )
-
+        st.caption("🔇 Audio bambara indisponible — Space en veille, réessayez dans 30s.")
 
 
 # ─── CLASSES PLANTVILLAGE PAR DÉFAUT (38 classes) ─────────────────────
@@ -1081,8 +1157,14 @@ if active_file is not None:
                 "avec une bonne lumière naturelle et une seule feuille dans le cadre.",
             )
             play_audio_bambara(
-                "Sɛgɛsɛgɛ kɛra ka gɛlɛn. Foto wɛrɛ kɛ ka ɲɛ, "
-                "ni yeelen ka ɲɛ, fɛn kelen dɔrɔn."
+                text_fr=(
+                    "L'analyse est incertaine. Prenez une autre photo plus claire "
+                    "avec une bonne lumière naturelle et une seule feuille dans le cadre."
+                ),
+                text_bam_fallback=(
+                    "Sɛgɛsɛgɛ kɛra ka gɛlɛn. Foto wɛrɛ kɛ ka ɲɛ, "
+                    "ni yeelen ka ɲɛ, fɛn kelen dɔrɔn."
+                ),
             )
 
         # ── Cas 2 : Plante saine ─────────────────────────────────────
@@ -1107,7 +1189,10 @@ if active_file is not None:
             st.info(f"🌿 **{nom_fr}**\n\n{info['conseil_fr']}")
 
             play_audio_fr(f"{nom_fr}. {info['conseil_fr']}")
-            play_audio_bambara(f"{nom_bam}. {info['conseil_bam']}")
+            play_audio_bambara(
+                text_fr=f"{nom_fr}. {info['conseil_fr']}",
+                text_bam_fallback=f"{nom_bam}. {info['conseil_bam']}",
+            )
 
         # ── Cas 3 : Maladie détectée ─────────────────────────────────
         else:
@@ -1131,7 +1216,10 @@ if active_file is not None:
             st.warning(f"**Que faire ?**\n\n{info['conseil_fr']}")
 
             play_audio_fr(f"Maladie détectée : {nom_fr}. {info['conseil_fr']}")
-            play_audio_bambara(f"Bana tɔgɔ : {nom_bam}. {info['conseil_bam']}")
+            play_audio_bambara(
+                text_fr=f"Maladie détectée : {nom_fr}. {info['conseil_fr']}",
+                text_bam_fallback=f"Bana tɔgɔ : {nom_bam}. {info['conseil_bam']}",
+            )
 
         # ── Top 3 ───────────────────────────────────────────────────
         if len(results) > 1:

@@ -641,35 +641,60 @@ def translate_fr_to_bambara(text_fr: str) -> str | None:
     tokenizer, model = load_bambara_translator()
     if tokenizer is None or model is None:
         return None
+
+    # Nettoyer le texte : supprimer emojis et puces bullet
+    import re
+    text_clean = re.sub(r"[•🌿🌽🍎🍇🥔🍓🌶️🍒🍑🫘🍰]", "", text_fr)
+    text_clean = re.sub(r"\n+", ". ", text_clean).strip()
+    text_clean = re.sub(r"\s+", " ", text_clean)
+
+    # Limiter à 400 caractères pour éviter les boucles sur textes longs
+    if len(text_clean) > 400:
+        text_clean = text_clean[:400].rsplit(" ", 1)[0]
+
+    if not text_clean:
+        return None
+
     try:
-        from transformers import AutoTokenizer
         import torch
 
-        # Forcer la langue source
         tokenizer.src_lang = "fra_Latn"
 
         inputs = tokenizer(
-            text_fr,
+            text_clean,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=256,
         )
 
-        # Token cible bambara
         forced_bos = tokenizer.convert_tokens_to_ids("bam_Latn")
 
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
                 forced_bos_token_id=forced_bos,
-                max_new_tokens=256,
+                max_new_tokens=200,
                 num_beams=4,
                 early_stopping=True,
+                repetition_penalty=2.5,   # bloque les répétitions infinies
+                no_repeat_ngram_size=4,   # interdit de répéter 4-grammes
+                length_penalty=1.0,
             )
 
         translated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return translated.strip() if translated.strip() else None
+        result = translated.strip()
+
+        # Vérification sanité : si un mot représente > 30% des tokens → boucle détectée
+        if result:
+            words = result.split()
+            if len(words) > 5:
+                most_common = max(set(words), key=words.count)
+                if words.count(most_common) / len(words) > 0.3:
+                    return None  # traduction invalide, on fallback
+
+        return result if result else None
+
     except Exception:
         return None
 
@@ -1180,19 +1205,40 @@ if active_file is not None:
                 </div>
             """, unsafe_allow_html=True)
 
-            st.markdown(
-                f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
-                f'{info["conseil_bam"]}</div>',
-                unsafe_allow_html=True,
-            )
             st.balloons()
             st.info(f"🌿 **{nom_fr}**\n\n{info['conseil_fr']}")
-
             play_audio_fr(f"{nom_fr}. {info['conseil_fr']}")
-            play_audio_bambara(
-                text_fr=f"{nom_fr}. {info['conseil_fr']}",
-                text_bam_fallback=f"{nom_bam}. {info['conseil_bam']}",
-            )
+
+            # ── Traduction FR→BAM puis mise à jour de la bambara-box ──
+            texte_fr_pour_trad = f"{nom_fr}. {info['conseil_fr']}"
+            with st.spinner("🌍 Traduction français → bambara…"):
+                traduction = translate_fr_to_bambara(texte_fr_pour_trad)
+
+            if traduction:
+                st.markdown(
+                    f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
+                    f'{traduction}</div>',
+                    unsafe_allow_html=True,
+                )
+                texte_tts = traduction
+            else:
+                # Fallback : texte bambara du dictionnaire
+                st.markdown(
+                    f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
+                    f'{info["conseil_bam"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                texte_tts = f"{nom_bam}. {info['conseil_bam']}"
+
+            # ── Audio bambara ──────────────────────────────────────────
+            with st.spinner("🔊 Génération audio bambara…"):
+                b64_bam = text_to_audio_b64_bambara(texte_tts)
+            if b64_bam:
+                st.markdown('<div class="audio-label">🔊 Kelima bambara kan 🇲🇱</div>',
+                            unsafe_allow_html=True)
+                st.markdown(_audio_player_html(b64_bam, "audio/wav"), unsafe_allow_html=True)
+            else:
+                st.caption("🔇 Audio bambara indisponible — Space en veille, réessayez dans 30s.")
 
         # ── Cas 3 : Maladie détectée ─────────────────────────────────
         else:
@@ -1207,19 +1253,39 @@ if active_file is not None:
                 </div>
             """, unsafe_allow_html=True)
 
-            st.markdown(
-                f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
-                f'<b>Ɲɛsira (Conseils) :</b><br>{info["conseil_bam"]}</div>',
-                unsafe_allow_html=True,
-            )
             st.error(f"**Maladie : {nom_fr}**")
             st.warning(f"**Que faire ?**\n\n{info['conseil_fr']}")
-
             play_audio_fr(f"Maladie détectée : {nom_fr}. {info['conseil_fr']}")
-            play_audio_bambara(
-                text_fr=f"Maladie détectée : {nom_fr}. {info['conseil_fr']}",
-                text_bam_fallback=f"Bana tɔgɔ : {nom_bam}. {info['conseil_bam']}",
-            )
+
+            # ── Traduction FR→BAM puis mise à jour de la bambara-box ──
+            texte_fr_pour_trad = f"Maladie : {nom_fr}. {info['conseil_fr']}"
+            with st.spinner("🌍 Traduction français → bambara…"):
+                traduction = translate_fr_to_bambara(texte_fr_pour_trad)
+
+            if traduction:
+                st.markdown(
+                    f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
+                    f'<b>Ɲɛsira (Conseils) :</b><br>{traduction}</div>',
+                    unsafe_allow_html=True,
+                )
+                texte_tts = traduction
+            else:
+                st.markdown(
+                    f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
+                    f'<b>Ɲɛsira (Conseils) :</b><br>{info["conseil_bam"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                texte_tts = f"Bana tɔgɔ : {nom_bam}. {info['conseil_bam']}"
+
+            # ── Audio bambara ──────────────────────────────────────────
+            with st.spinner("🔊 Génération audio bambara…"):
+                b64_bam = text_to_audio_b64_bambara(texte_tts)
+            if b64_bam:
+                st.markdown('<div class="audio-label">🔊 Kelima bambara kan 🇲🇱</div>',
+                            unsafe_allow_html=True)
+                st.markdown(_audio_player_html(b64_bam, "audio/wav"), unsafe_allow_html=True)
+            else:
+                st.caption("🔇 Audio bambara indisponible — Space en veille, réessayez dans 30s.")
 
         # ── Top 3 ───────────────────────────────────────────────────
         if len(results) > 1:

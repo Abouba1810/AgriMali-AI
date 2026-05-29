@@ -754,8 +754,8 @@ def load_model():
     with st.spinner("📥 Chargement du modèle depuis Hugging Face…"):
         try:
             model_path = hf_hub_download(
-                repo_id="sudoping01/crop-disease-detection",
-                filename="best.pt",
+                repo_id="Abouba1810/AgriMali-EfficientNetV2",
+                filename="agrimali_best-v2.pth",
                 token=None,   # Mettre un token HF ici si le repo devient privé
             )
         except Exception as e:

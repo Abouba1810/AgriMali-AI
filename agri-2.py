@@ -68,7 +68,7 @@ DISEASE_DB = {
     # ── TOMATE ──────────────────────────────────────────────────────────
     "tomato bacterial spot": {
         "fr": "Tache bactérienne de la tomate",
-        "bam": "Tomatiki ni bana kɔrɔ (tache noire)",
+        "bam": "Tomati ni bana kɔrɔ  (tache noire)",
         "conseil_fr": (
             "• Retirez et brûlez les feuilles atteintes.\n"
             "• Appliquez un fongicide à base de cuivre.\n"
@@ -596,32 +596,89 @@ def get_disease_info(raw_label: str) -> dict:
     return DISEASE_DB["default"]
 
 
-# ─── gTTS : GÉNÉRATION AUDIO ──────────────────────────────────────────
-def text_to_audio_b64(text: str, lang: str = "fr") -> str:
-    """Génère un audio gTTS et retourne le base64 pour lecture HTML."""
+# ─── AUDIO : gTTS (français) + MALIBA-AI (bambara) ───────────────────
+
+def text_to_audio_b64_fr(text: str) -> str | None:
+    """gTTS en français → base64 MP3."""
     try:
-        tts = gTTS(text=text, lang=lang, slow=False)
+        tts = gTTS(text=text, lang="fr", slow=False)
         buf = io.BytesIO()
         tts.write_to_fp(buf)
         buf.seek(0)
-        audio_b64 = base64.b64encode(buf.read()).decode("utf-8")
-        return audio_b64
+        return base64.b64encode(buf.read()).decode("utf-8")
     except Exception as e:
-        st.warning(f"Audio indisponible : {e}")
+        st.warning(f"Audio français indisponible : {e}")
         return None
 
 
-def play_audio(text: str, lang: str = "fr", label: str = "Écouter en français"):
-    """Affiche un bouton audio inline."""
-    audio_b64 = text_to_audio_b64(text, lang)
-    if audio_b64:
+def text_to_audio_b64_bambara(text: str) -> str | None:
+    """
+    Appelle le Space HF MALIBA-AI/BambaraText2Speech via l'API Gradio.
+    Retourne le base64 du WAV généré, ou None si le Space est indisponible.
+
+    Le Space utilise maliba_ai sous Gradio — on interroge l'endpoint
+    /predict avec le texte et l'ID du locuteur (Bourama par défaut).
+    """
+    try:
+        from gradio_client import Client
+        client = Client("MALIBA-AI/BambaraText2Speech", verbose=False)
+        # L'interface Gradio expose : texte (str) + speaker (str)
+        result = client.predict(
+            text,
+            "Bourama",   # locuteur masculin clair — idéal pour messages agricoles
+            api_name="/predict",
+        )
+        # result est le chemin vers le fichier audio généré côté serveur
+        if isinstance(result, str) and os.path.exists(result):
+            with open(result, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        # Parfois result est un dict avec une clé "value" ou "path"
+        if isinstance(result, dict):
+            path = result.get("value") or result.get("path") or result.get("name")
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+        return None
+    except Exception:
+        # Space en veille ou gradio_client absent → fallback silencieux
+        return None
+
+
+def _audio_player_html(audio_b64: str, mime: str = "audio/mp3") -> str:
+    return (
+        f'<audio controls style="width:100%; margin-bottom:8px;">'
+        f'<source src="data:{mime};base64,{audio_b64}" type="{mime}">'
+        f"</audio>"
+    )
+
+
+def play_audio_fr(text: str, label: str = "Écouter en français 🇫🇷"):
+    """Lecture audio en français via gTTS."""
+    b64 = text_to_audio_b64_fr(text)
+    if b64:
         st.markdown(f'<div class="audio-label">🔊 {label}</div>', unsafe_allow_html=True)
-        audio_html = f"""
-        <audio controls style="width:100%; margin-bottom:8px;">
-            <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
-        </audio>
-        """
-        st.markdown(audio_html, unsafe_allow_html=True)
+        st.markdown(_audio_player_html(b64, "audio/mp3"), unsafe_allow_html=True)
+
+
+def play_audio_bambara(text: str, label: str = "Kelima bambara kan 🇲🇱"):
+    """
+    Lecture audio en bambara via MALIBA-AI/BambaraText2Speech.
+    Affiche un spinner pendant la génération (le Space peut mettre 3-8s).
+    Si le Space est indisponible, affiche un message discret sans planter.
+    """
+    with st.spinner("🔊 Génération audio bambara…"):
+        b64 = text_to_audio_b64_bambara(text)
+
+    if b64:
+        st.markdown(f'<div class="audio-label">🔊 {label}</div>', unsafe_allow_html=True)
+        # Le Space retourne du WAV
+        st.markdown(_audio_player_html(b64, "audio/wav"), unsafe_allow_html=True)
+    else:
+        st.caption(
+            "🔇 Audio bambara indisponible pour l'instant "
+            "(Space en veille — réessayez dans 30 secondes)."
+        )
+
 
 
 # ─── CLASSES PLANTVILLAGE PAR DÉFAUT (38 classes) ─────────────────────
@@ -697,8 +754,8 @@ def load_model():
     with st.spinner("📥 Chargement du modèle depuis Hugging Face…"):
         try:
             model_path = hf_hub_download(
-                repo_id="Abouba1810/AgriMali-EfficientNetV2",
-                filename="agrimali_best-v2.pth",
+                repo_id="sudoping01/crop-disease-detection",
+                filename="best.pt",
                 token=None,   # Mettre un token HF ici si le repo devient privé
             )
         except Exception as e:
@@ -1002,11 +1059,13 @@ if active_file is not None:
                     </p>
                 </div>
             """, unsafe_allow_html=True)
-            play_audio(
+            play_audio_fr(
                 "Analyse incertaine. Veuillez reprendre une photo plus claire "
                 "avec une bonne lumière naturelle et une seule feuille dans le cadre.",
-                lang="fr",
-                label="Écouter le conseil en français",
+            )
+            play_audio_bambara(
+                "Sɛgɛsɛgɛ kɛra ka gɛlɛn. Foto wɛrɛ kɛ ka ɲɛ, "
+                "ni yeelen ka ɲɛ, fɛn kelen dɔrɔn."
             )
 
         # ── Cas 2 : Plante saine ─────────────────────────────────────
@@ -1027,15 +1086,11 @@ if active_file is not None:
                 f'{info["conseil_bam"]}</div>',
                 unsafe_allow_html=True,
             )
-
             st.balloons()
             st.info(f"🌿 **{nom_fr}**\n\n{info['conseil_fr']}")
 
-            play_audio(
-                f"{nom_fr}. {info['conseil_fr']}",
-                lang="fr",
-                label="Écouter le résultat en français",
-            )
+            play_audio_fr(f"{nom_fr}. {info['conseil_fr']}")
+            play_audio_bambara(f"{nom_bam}. {info['conseil_bam']}")
 
         # ── Cas 3 : Maladie détectée ─────────────────────────────────
         else:
@@ -1050,34 +1105,16 @@ if active_file is not None:
                 </div>
             """, unsafe_allow_html=True)
 
-            # Nom en bambara + conseils bambara
             st.markdown(
                 f'<div class="bambara-box">🗣️ <b>Bambara :</b> {nom_bam}<br><br>'
                 f'<b>Ɲɛsira (Conseils) :</b><br>{info["conseil_bam"]}</div>',
                 unsafe_allow_html=True,
             )
-
-            # Conseils en français
             st.error(f"**Maladie : {nom_fr}**")
             st.warning(f"**Que faire ?**\n\n{info['conseil_fr']}")
 
-            # Audio français : nom + conseils
-            texte_audio_fr = f"Maladie détectée : {nom_fr}. {info['conseil_fr']}"
-            play_audio(texte_audio_fr, lang="fr", label="Écouter le diagnostic en français")
-
-            # Audio bambara via gTTS français (bambara pas supporté nativement)
-            # On lit le texte français avec une intro en bambara
-            texte_audio_bam_approx = (
-                f"Bana tɔgɔ : {nom_bam}. "
-                f"Ɲɛsira : {info['conseil_bam']}"
-            )
-            # gTTS ne supporte pas le bambara → on lit en français avec voix lente
-            # pour que l'agriculteur puisse suivre avec le texte bambara affiché
-            play_audio(
-                f"Bambara : {nom_fr}. {info['conseil_fr']}",
-                lang="fr",
-                label="Écouter (lecture du texte affiché en bambara)",
-            )
+            play_audio_fr(f"Maladie détectée : {nom_fr}. {info['conseil_fr']}")
+            play_audio_bambara(f"Bana tɔgɔ : {nom_bam}. {info['conseil_bam']}")
 
         # ── Top 3 ───────────────────────────────────────────────────
         if len(results) > 1:

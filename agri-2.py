@@ -68,7 +68,7 @@ DISEASE_DB = {
     # ── TOMATE ──────────────────────────────────────────────────────────
     "tomato bacterial spot": {
         "fr": "Tache bactérienne de la tomate",
-        "bam": "Tomati ni bana kɔrɔ  (tache noire)",
+        "bam": "Tomatiki ni bana kɔrɔ (tache noire)",
         "conseil_fr": (
             "• Retirez et brûlez les feuilles atteintes.\n"
             "• Appliquez un fongicide à base de cuivre.\n"
@@ -613,34 +613,51 @@ def text_to_audio_b64_fr(text: str) -> str | None:
 
 def text_to_audio_b64_bambara(text: str) -> str | None:
     """
-    Appelle le Space HF MALIBA-AI/BambaraText2Speech via l'API Gradio.
-    Retourne le base64 du WAV généré, ou None si le Space est indisponible.
+    Appelle Abouba1810/agrimali-bambaraTTS via l'API Gradio.
 
-    Le Space utilise maliba_ai sous Gradio — on interroge l'endpoint
-    /predict avec le texte et l'ID du locuteur (Bourama par défaut).
+    D'après le code source du Space (app.py) :
+      - modèle   : sudoping01/bambara-tts (VitsModel / Meta MMS)
+      - endpoint : /generate_audio
+      - input    : text (str) — UN SEUL argument
+      - output   : tuple (sample_rate: int, waveform: np.ndarray)
+                   → gradio_client retourne un fichier WAV temporaire local
+
+    Retourne le base64 WAV, ou None si le Space est indisponible.
     """
     try:
         from gradio_client import Client
-        client = Client("MALIBA-AI/BambaraText2Speech", verbose=False)
-        # L'interface Gradio expose : texte (str) + speaker (str)
+        client = Client("Abouba1810/agrimali-bambaraTTS", verbose=False)
         result = client.predict(
             text,
-            "Bourama",   # locuteur masculin clair — idéal pour messages agricoles
-            api_name="/predict",
+            api_name="/generate_audio",
         )
-        # result est le chemin vers le fichier audio généré côté serveur
+        # Le Space retourne (sample_rate, waveform_numpy).
+        # gradio_client sérialise le numpy audio en un fichier WAV local.
+        # result[0] = chemin WAV temporaire, result[1] = message d'erreur éventuel
+        if isinstance(result, (tuple, list)):
+            audio_part = result[0]
+            # audio_part peut être un chemin fichier (str) ou un tuple (sr, array)
+            if isinstance(audio_part, str) and os.path.exists(audio_part):
+                with open(audio_part, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+            # Fallback : encoder le numpy directement en WAV en mémoire
+            if isinstance(audio_part, (tuple, list)) and len(audio_part) == 2:
+                import numpy as np
+                import scipy.io.wavfile as wav_io
+                sr, waveform = audio_part
+                waveform = np.array(waveform)
+                if waveform.dtype != np.int16:
+                    waveform = (waveform * 32767).astype(np.int16)
+                buf = io.BytesIO()
+                wav_io.write(buf, sr, waveform)
+                buf.seek(0)
+                return base64.b64encode(buf.read()).decode("utf-8")
+        # result est directement un chemin fichier
         if isinstance(result, str) and os.path.exists(result):
             with open(result, "rb") as f:
                 return base64.b64encode(f.read()).decode("utf-8")
-        # Parfois result est un dict avec une clé "value" ou "path"
-        if isinstance(result, dict):
-            path = result.get("value") or result.get("path") or result.get("name")
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    return base64.b64encode(f.read()).decode("utf-8")
         return None
     except Exception:
-        # Space en veille ou gradio_client absent → fallback silencieux
         return None
 
 
